@@ -58,6 +58,7 @@ import (
 const (
 	lastSuccessfulConfiguration = "mongodb.com/v1.lastSuccessfulConfiguration"
 	lastAppliedMongoDBVersion   = "mongodb.com/v1.lastAppliedMongoDBVersion"
+	mongoDBCommunityFinalizer   = "mongodbcommunity.mongodb.com/v1.mongodbCommunityFinalizer"
 )
 
 func init() {
@@ -159,11 +160,26 @@ func (r ReplicaSetReconciler) Reconcile(ctx context.Context, request reconcile.R
 	r.log = zap.S().With("ReplicaSet", request.NamespacedName)
 	r.log.Infof("Reconciling MongoDB")
 
+	if !mdb.DeletionTimestamp.IsZero() {
+		r.log.Debug("Deleting MongoDB")
+		if controllerutil.ContainsFinalizer(&mdb, mongoDBCommunityFinalizer) {
+			return r.reconcileDelete(ctx, &mdb)
+		}
+		return result.OK()
+	}
+
 	r.log.Debug("Validating MongoDB.Spec")
 	lastAppliedSpec, err := r.validateSpec(mdb)
 	if err != nil {
 		return status.Update(ctx, r.client.Status(), &mdb, statusOptions().
 			withMessage(Error, fmt.Sprintf("error validating new Spec: %s", err)).
+			withFailedPhase())
+	}
+
+	r.log.Debug("Adding finalizer")
+	if err := r.ensureFinalizer(ctx, &mdb); err != nil {
+		return status.Update(ctx, r.client.Status(), &mdb, statusOptions().
+			withMessage(Error, fmt.Sprintf("Error adding finalizer: %s", err)).
 			withFailedPhase())
 	}
 
@@ -251,17 +267,23 @@ func (r ReplicaSetReconciler) Reconcile(ctx context.Context, request reconcile.R
 	}
 
 	if err := r.updateConnectionStringSecrets(ctx, mdb); err != nil { // nolint:forbidigo
-		r.log.Errorf("Could not update connection string secrets: %s", err)
+		return status.Update(ctx, r.client.Status(), &mdb, statusOptions().
+			withMessage(Error, fmt.Sprintf("Could not update connection string secrets: %s", err)).
+			withFailedPhase())
 	}
 
 	if lastAppliedSpec != nil {
 		r.cleanupScramSecrets(ctx, mdb.Spec, *lastAppliedSpec, mdb.Namespace)
 		r.cleanupPemSecret(ctx, mdb.Spec, *lastAppliedSpec, mdb.Namespace)
-		r.cleanupConnectionStringSecrets(ctx, mdb.Spec, *lastAppliedSpec, mdb.Namespace, mdb.Name)
+		if err := r.cleanupConnectionStringSecrets(ctx, mdb.Spec, *lastAppliedSpec, mdb); err != nil {
+			return status.Update(ctx, r.client.Status(), &mdb, statusOptions().
+				withMessage(Error, fmt.Sprintf("Could not clean up connection string secrets: %s", err)).
+				withFailedPhase())
+		}
 	}
 
 	if err := r.updateLastSuccessfulConfiguration(ctx, mdb); err != nil {
-		r.log.Errorf("Could not save current spec as an annotation: %s", err)
+		return reconcile.Result{}, fmt.Errorf("save last successful MongoDBCommunity configuration: %w", err)
 	}
 
 	if res.RequeueAfter > 0 {
@@ -271,6 +293,54 @@ func (r ReplicaSetReconciler) Reconcile(ctx context.Context, request reconcile.R
 
 	r.log.Infof("Successfully finished reconciliation, MongoDBCommunity.Spec: %+v, MongoDBCommunity.Status: %+v", mdb.Spec, mdb.Status)
 	return res, err
+}
+
+func (r *ReplicaSetReconciler) ensureFinalizer(ctx context.Context, mdb *mdbv1.MongoDBCommunity) error {
+	if finalizerAdded := controllerutil.AddFinalizer(mdb, mongoDBCommunityFinalizer); finalizerAdded {
+		return r.client.Update(ctx, mdb)
+	}
+	return nil
+}
+
+func (r *ReplicaSetReconciler) reconcileDelete(ctx context.Context, mdb *mdbv1.MongoDBCommunity) (reconcile.Result, error) {
+	lastSuccessfulSpec, err := r.lastSuccessfulSpec(*mdb)
+	if err != nil {
+		return reconcile.Result{}, fmt.Errorf("read last successful configuration for connection string cleanup: %w", err)
+	}
+
+	// A previous reconcile may have created Secrets before saving a successful spec.
+	cleanupSpec := mdbv1.MongoDBCommunitySpec{Users: slices.Clone(mdb.Spec.Users)}
+	if lastSuccessfulSpec != nil {
+		cleanupSpec.Users = append(cleanupSpec.Users, lastSuccessfulSpec.Users...)
+	}
+	if err := r.cleanupConnectionStringSecrets(ctx, mdbv1.MongoDBCommunitySpec{}, cleanupSpec, *mdb); err != nil {
+		return reconcile.Result{}, err
+	}
+
+	if finalizerRemoved := controllerutil.RemoveFinalizer(mdb, mongoDBCommunityFinalizer); !finalizerRemoved {
+		return result.OK()
+	}
+
+	if err := r.client.Update(ctx, mdb); err != nil {
+		return reconcile.Result{}, fmt.Errorf("remove MongoDBCommunity finalizer: %w", err)
+	}
+
+	return result.OK()
+}
+
+func (r ReplicaSetReconciler) lastSuccessfulSpec(mdb mdbv1.MongoDBCommunity) (*mdbv1.MongoDBCommunitySpec, error) {
+	lastSuccessfulConfigurationSaved, ok := mdb.Annotations[lastSuccessfulConfiguration]
+	if !ok {
+		return nil, nil
+	}
+
+	lastSpec := mdbv1.MongoDBCommunitySpec{}
+	err := json.Unmarshal([]byte(lastSuccessfulConfigurationSaved), &lastSpec)
+	if err != nil {
+		return &lastSpec, err
+	}
+
+	return &lastSpec, nil
 }
 
 // updateLastSuccessfulConfiguration annotates the MongoDBCommunity resource with the latest configuration
@@ -633,19 +703,16 @@ func (r *ReplicaSetReconciler) buildService(mdb mdbv1.MongoDBCommunity, portMana
 // it checks that the attempted Spec is valid in relation to the Spec that resulted from that last successful configuration.
 // The validation also returns the lastSuccessFulConfiguration Spec as mdbv1.MongoDBCommunitySpec.
 func (r ReplicaSetReconciler) validateSpec(mdb mdbv1.MongoDBCommunity) (*mdbv1.MongoDBCommunitySpec, error) {
-	lastSuccessfulConfigurationSaved, ok := mdb.Annotations[lastSuccessfulConfiguration]
-	if !ok {
+	lastSpec, err := r.lastSuccessfulSpec(mdb)
+	if err != nil {
+		return lastSpec, err
+	}
+	if lastSpec == nil {
 		// First version of Spec
 		return nil, validation.ValidateInitialSpec(mdb, r.log)
 	}
 
-	lastSpec := mdbv1.MongoDBCommunitySpec{}
-	err := json.Unmarshal([]byte(lastSuccessfulConfigurationSaved), &lastSpec)
-	if err != nil {
-		return &lastSpec, err
-	}
-
-	return &lastSpec, validation.ValidateUpdate(mdb, lastSpec, r.log)
+	return lastSpec, validation.ValidateUpdate(mdb, *lastSpec, r.log)
 }
 
 func getCustomRolesModification(mdb mdbv1.MongoDBCommunity) (automationconfig.Modification, error) {

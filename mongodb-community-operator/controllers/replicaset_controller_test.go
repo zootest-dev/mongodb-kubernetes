@@ -14,6 +14,8 @@ import (
 	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/yaml"
@@ -721,6 +723,256 @@ func assertConnectionStringSecretAnnotations(ctx context.Context, t *testing.T, 
 	err := c.Get(ctx, secretNamespacedName, &connectionStringSecret)
 	require.NoError(t, err)
 	assert.Subset(t, connectionStringSecret.Annotations, expectedAnnotations)
+}
+
+func TestService_connectionStringSecretNamespaceAcrossNamespaces(t *testing.T) {
+	ctx := context.Background()
+	secretAnnotations := map[string]string{
+		"tests.annotation": "value",
+	}
+
+	mdb := newScramReplicaSet(mdbv1.MongoDBUser{
+		Name: "testuser",
+		PasswordSecretRef: v1.SecretKeyReference{
+			Name: "password-secret-name",
+		},
+		ScramCredentialsSecretName:        "scram-credentials",
+		ConnectionStringSecretNamespace:   "other-namespace",
+		ConnectionStringSecretAnnotations: secretAnnotations,
+	})
+	mdb.UID = "mongodb-owner"
+
+	mgr := client.NewManager(ctx, &mdb)
+	err := mgr.Client.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "other-namespace"}})
+	require.NoError(t, err)
+
+	err = createUserPasswordSecret(ctx, mgr.Client, mdb, "password-secret-name", "pass")
+	require.NoError(t, err)
+
+	r := NewReconciler(mgr, "fake-mongodbRepoUrl", "fake-mongodbImage", "ubi8", AgentImage, "fake-versionUpgradeHookImage", "fake-readinessProbeImage")
+	res, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: mdb.Namespace, Name: mdb.Name}})
+	assertReconciliationSuccessful(t, res, err)
+
+	connectionStringSecret := corev1.Secret{}
+	scramUsers := mdb.GetAuthUsers()
+	require.Len(t, scramUsers, 1)
+	secretNamespacedName := types.NamespacedName{Name: scramUsers[0].ConnectionStringSecretName, Namespace: scramUsers[0].ConnectionStringSecretNamespace}
+	err = mgr.Client.Get(ctx, secretNamespacedName, &connectionStringSecret)
+	require.NoError(t, err)
+	assert.Empty(t, connectionStringSecret.OwnerReferences)
+	assert.Equal(t, mdb.Namespace, connectionStringSecret.Annotations[connectionStringSecretOwnerNamespaceAnnotation])
+	assert.Equal(t, mdb.Name, connectionStringSecret.Annotations[connectionStringSecretOwnerNameAnnotation])
+	assert.Equal(t, string(mdb.UID), connectionStringSecret.Annotations[connectionStringSecretOwnerUIDAnnotation])
+	assert.Subset(t, connectionStringSecret.Annotations, secretAnnotations)
+
+	// Updating credentials must recognize the cross-namespace Secret on the next reconcile.
+	err = secret.UpdateField(ctx, mgr.Client, types.NamespacedName{Name: "password-secret-name", Namespace: mdb.Namespace}, "password", "updated-password")
+	require.NoError(t, err)
+	require.NoError(t, r.updateConnectionStringSecrets(ctx, mdb))
+	require.NoError(t, mgr.Client.Get(ctx, secretNamespacedName, &connectionStringSecret))
+	assert.Equal(t, "updated-password", string(connectionStringSecret.Data["password"]))
+	assert.Contains(t, string(connectionStringSecret.Data["connectionString.standard"]), "updated-password")
+	assert.Equal(t, string(mdb.UID), connectionStringSecret.Annotations[connectionStringSecretOwnerUIDAnnotation])
+	assert.Empty(t, connectionStringSecret.OwnerReferences)
+}
+
+func TestUpdateConnectionStringSecretsRespectsOwnership(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		namespace      string
+		existing       bool
+		ownerUID       types.UID
+		ownerNamespace string
+		ownerName      string
+		wantError      bool
+	}{
+		{name: "new same-namespace secret uses owner references", namespace: "my-ns"},
+		{name: "same-namespace owned secret is updated", namespace: "my-ns", existing: true, ownerUID: "mongodb-owner"},
+		{name: "cross-namespace owned secret is updated", namespace: "other-ns", existing: true, ownerUID: "mongodb-owner"},
+		{name: "cross-namespace unmanaged secret is preserved", namespace: "other-ns", existing: true, wantError: true},
+		{name: "same-namespace unmanaged secret is preserved", namespace: "my-ns", existing: true, wantError: true},
+		{name: "recreated resource cannot claim previous resource secret", namespace: "other-ns", existing: true, ownerUID: "previous-owner", wantError: true},
+		{name: "another resource namespace cannot claim secret", namespace: "other-ns", existing: true, ownerUID: "mongodb-owner", ownerNamespace: "another-ns", wantError: true},
+		{name: "another resource name cannot claim secret", namespace: "other-ns", existing: true, ownerUID: "mongodb-owner", ownerName: "another-rs", wantError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			mdb := newScramReplicaSet(mdbv1.MongoDBUser{
+				Name: "external-user", DB: "$external",
+				ConnectionStringSecretName:        "connection-string",
+				ConnectionStringSecretNamespace:   tc.namespace,
+				ConnectionStringSecretAnnotations: map[string]string{"tests.annotation": "value"},
+			})
+			mdb.UID = "mongodb-owner"
+			mdb.Kind = "MongoDBCommunity"
+			mgr := client.NewManager(ctx, &mdb)
+			r := NewReconciler(mgr, "fake-mongodbRepoUrl", "fake-mongodbImage", "ubi8", AgentImage, "fake-versionUpgradeHookImage", "fake-readinessProbeImage")
+			target := types.NamespacedName{Name: "connection-string", Namespace: tc.namespace}
+			existing := corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: target.Name, Namespace: target.Namespace},
+				Data:       map[string][]byte{"preserve": []byte("original-value")},
+			}
+			if tc.ownerUID != "" {
+				owner := mdb.DeepCopy()
+				owner.UID = tc.ownerUID
+				if tc.ownerNamespace != "" {
+					owner.Namespace = tc.ownerNamespace
+				}
+				if tc.ownerName != "" {
+					owner.Name = tc.ownerName
+				}
+				if tc.namespace == mdb.Namespace {
+					existing.OwnerReferences = owner.GetOwnerReferences()
+				} else {
+					existing.Annotations = map[string]string{
+						connectionStringSecretOwnerNamespaceAnnotation: owner.Namespace,
+						connectionStringSecretOwnerNameAnnotation:      owner.Name,
+						connectionStringSecretOwnerUIDAnnotation:       string(owner.UID),
+					}
+				}
+			}
+			if tc.existing {
+				require.NoError(t, mgr.Client.Create(ctx, &existing))
+			}
+
+			err := r.updateConnectionStringSecrets(ctx, mdb)
+			actual, getErr := r.client.GetSecret(ctx, target)
+			require.NoError(t, getErr)
+			if tc.wantError {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), "not managed")
+				assert.Equal(t, existing, actual, "foreign Secret must remain unchanged")
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, "external-user", string(actual.Data["username"]))
+			assert.Equal(t, "value", actual.Annotations["tests.annotation"])
+			if tc.namespace == mdb.Namespace {
+				assert.Equal(t, mdb.GetOwnerReferences(), actual.OwnerReferences)
+			} else {
+				assert.Empty(t, actual.OwnerReferences)
+				assert.Equal(t, mdb.Namespace, actual.Annotations[connectionStringSecretOwnerNamespaceAnnotation])
+				assert.Equal(t, mdb.Name, actual.Annotations[connectionStringSecretOwnerNameAnnotation])
+				assert.Equal(t, string(mdb.UID), actual.Annotations[connectionStringSecretOwnerUIDAnnotation])
+			}
+		})
+	}
+}
+
+func TestUpdateConnectionStringSecretsPreservesConcurrentReplacement(t *testing.T) {
+	for _, existing := range []bool{false, true} {
+		name := "created after lookup"
+		if existing {
+			name = "replaced after ownership check"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			mdb := newScramReplicaSet(mdbv1.MongoDBUser{
+				Name: "external-user", DB: "$external",
+				ConnectionStringSecretName:      "connection-string",
+				ConnectionStringSecretNamespace: "other-ns",
+			})
+			mdb.UID = "mongodb-owner"
+			scheme := runtime.NewScheme()
+			require.NoError(t, corev1.AddToScheme(scheme))
+			require.NoError(t, mdbv1.AddToScheme(scheme))
+			objects := []k8sClient.Object{&mdb}
+			if existing {
+				objects = append(objects, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+					Name: "connection-string", Namespace: "other-ns", UID: "owned-secret", ResourceVersion: "7",
+					Annotations: map[string]string{
+						connectionStringSecretOwnerNamespaceAnnotation: mdb.Namespace,
+						connectionStringSecretOwnerNameAnnotation:      mdb.Name,
+						connectionStringSecretOwnerUIDAnnotation:       string(mdb.UID),
+					},
+				}})
+			}
+			foreign := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "connection-string", Namespace: "other-ns", UID: "replacement-secret"},
+				Data:       map[string][]byte{"preserve": []byte("original-value")},
+			}
+			cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).WithInterceptorFuncs(interceptor.Funcs{
+				Create: func(ctx context.Context, cl k8sClient.WithWatch, obj k8sClient.Object, opts ...k8sClient.CreateOption) error {
+					if !existing {
+						require.NoError(t, cl.Create(ctx, foreign))
+					}
+					return cl.Create(ctx, obj, opts...)
+				},
+				Update: func(ctx context.Context, cl k8sClient.WithWatch, obj k8sClient.Object, opts ...k8sClient.UpdateOption) error {
+					if existing {
+						assert.Equal(t, types.UID("owned-secret"), obj.GetUID())
+						assert.Equal(t, "7", obj.GetResourceVersion())
+						require.NoError(t, cl.Delete(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: foreign.Name, Namespace: foreign.Namespace}}))
+						require.NoError(t, cl.Create(ctx, foreign))
+					}
+					return cl.Update(ctx, obj, opts...)
+				},
+			}).Build()
+			mgr := client.NewManagerWithClient(cl)
+			r := NewReconciler(mgr, "fake-mongodbRepoUrl", "fake-mongodbImage", "ubi8", AgentImage, "fake-versionUpgradeHookImage", "fake-readinessProbeImage")
+
+			err := r.updateConnectionStringSecrets(ctx, mdb)
+			if existing {
+				assert.True(t, apiErrors.IsConflict(err), "replacement must cause an update conflict, got %v", err)
+			} else {
+				assert.True(t, apiErrors.IsAlreadyExists(err), "competing creation must not overwrite Secret, got %v", err)
+			}
+			actual, err := r.client.GetSecret(ctx, types.NamespacedName{Name: foreign.Name, Namespace: foreign.Namespace})
+			require.NoError(t, err)
+			assert.Equal(t, foreign.UID, actual.UID)
+			assert.Equal(t, foreign.Data, actual.Data)
+			assert.Empty(t, actual.Annotations)
+		})
+	}
+}
+
+func TestReconcileConnectionStringFailurePreservesPreviousConfiguration(t *testing.T) {
+	ctx := context.Background()
+	mdb := newScramReplicaSet(mdbv1.MongoDBUser{
+		Name:                            "testuser",
+		PasswordSecretRef:               v1.SecretKeyReference{Name: "password-secret"},
+		ScramCredentialsSecretName:      "scram-credentials",
+		ConnectionStringSecretName:      "connection-string",
+		ConnectionStringSecretNamespace: "new-ns",
+	})
+	mdb.UID = "mongodb-owner"
+	previous := mdb.Spec.DeepCopy()
+	previous.Users[0].ConnectionStringSecretNamespace = "old-ns"
+	encoded, err := json.Marshal(previous)
+	require.NoError(t, err)
+	mdb.Annotations[lastSuccessfulConfiguration] = string(encoded)
+
+	mgr := client.NewManager(ctx, &mdb)
+	require.NoError(t, createUserPasswordSecret(ctx, mgr.Client, mdb, "password-secret", "pass"))
+	oldSecret := corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+		Name: "connection-string", Namespace: "old-ns",
+		Annotations: map[string]string{
+			connectionStringSecretOwnerNamespaceAnnotation: mdb.Namespace,
+			connectionStringSecretOwnerNameAnnotation:      mdb.Name,
+			connectionStringSecretOwnerUIDAnnotation:       string(mdb.UID),
+		},
+	}}
+	foreignSecret := corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "connection-string", Namespace: "new-ns"},
+		Data:       map[string][]byte{"preserve": []byte("original-value")},
+	}
+	require.NoError(t, mgr.Client.Create(ctx, &oldSecret))
+	require.NoError(t, mgr.Client.Create(ctx, &foreignSecret))
+	r := NewReconciler(mgr, "fake-mongodbRepoUrl", "fake-mongodbImage", "ubi8", AgentImage, "fake-versionUpgradeHookImage", "fake-readinessProbeImage")
+
+	_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: mdb.NamespacedName()})
+	require.NoError(t, err)
+	persisted := &mdbv1.MongoDBCommunity{}
+	require.NoError(t, mgr.Client.Get(ctx, mdb.NamespacedName(), persisted))
+	assert.Equal(t, mdbv1.Failed, persisted.Status.Phase)
+	assert.Contains(t, persisted.Status.Message, "not managed")
+	assert.Equal(t, string(encoded), persisted.Annotations[lastSuccessfulConfiguration], "failed update must not advance the cleanup snapshot")
+	actual, err := r.client.GetSecret(ctx, types.NamespacedName{Name: oldSecret.Name, Namespace: oldSecret.Namespace})
+	require.NoError(t, err)
+	assert.Equal(t, oldSecret, actual, "previous working Secret must remain available")
+	actual, err = r.client.GetSecret(ctx, types.NamespacedName{Name: foreignSecret.Name, Namespace: foreignSecret.Namespace})
+	require.NoError(t, err)
+	assert.Equal(t, foreignSecret, actual)
 }
 
 func TestService_configuresPrometheusCustomPorts(t *testing.T) {
